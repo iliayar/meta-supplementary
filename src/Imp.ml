@@ -10,9 +10,9 @@ struct
   let toPrintable s = M.bindings s
 
   let empty = M.empty
-  let set   m name value = M.add name value m
+  let set m name value = M.add name value m
   let unset m name = M.remove name m
-  
+
   exception Undefined_variable of string
       
   let get m name =
@@ -20,14 +20,30 @@ struct
     | Some x -> x
     | None   -> raise (Undefined_variable name)
 
-  let dynamic m name =
-    None = M.find_opt name m 
+  let dynamic m name = M.find_opt name m = None
+
+  let equal (l : t) (r : t) = M.equal (=) l r
 
   let residualize r z state =
     List.fold_left
       (fun acc (x, v) -> r acc x v)
       z
       (M.bindings state)
+
+  let join lstate rstate =
+    M.merge
+      (fun key l r -> match l, r with
+       | Some lv, Some rv when lv = rv -> Some lv
+       | _, _                          -> None
+      ) lstate rstate
+
+  let subtract lstate rstate =
+    M.merge
+      (fun key l r -> match l, r with
+       | None, _        -> None
+       | l, None        -> l
+       | Some _, Some _ -> None
+      ) lstate rstate
   
   module Printable =
   struct
@@ -136,15 +152,19 @@ struct
   | Binop (op, x, y) ->
     evalBinop (eval state x) (eval state y) op
 
+  let rec to_string = function
+  | Var x -> x
+  | Const x -> Int.to_string x
+  | Binop (op, x, y) -> Printf.sprintf "(%s %s %s)" (to_string x) op (to_string y)
+
   let rec spec state = function
-  | Var   x as expr -> if State.dynamic state x then expr else Const (State.get state x)
-  | Const x as expr -> expr
+  | Var x as expr    -> if State.dynamic state x then expr else Const (State.get state x)
+  | Const x as expr  -> expr
   | Binop (op, x, y) ->
-     let x', y' = spec state x, spec state y in
-     match x', y' with
-     | Const xv, Const yv -> Const (evalBinop xv yv op)
-     | _, _ -> Binop (op, x', y')
-  
+    let x', y' = spec state x, spec state y in
+    match x', y' with
+    | Const xv, Const yv -> Const (evalBinop xv yv op)
+    | _, _               -> Binop (op, x', y')
 end
 
 module Stmt =
@@ -204,44 +224,91 @@ struct
      else eval (eval state b) w                 
   | Do (b, c) as w -> eval state (Seq (b, While (c, b)))      
 
-  let residualize state stmt =
+  let residualize ?(before=false) state stmt =
     State.residualize (function
-          Skip -> fun x v -> Assn (x, Expr.Const v)
-        | acc  -> fun x v -> Seq  (acc, Assn (x, Expr.Const v))
-      ) stmt state
-  
-  let rec spec state =
+                       | Skip -> fun x v -> Assn (x, Const v)
+                       | acc  -> fun x v ->
+                         if before
+                         then Seq (Assn (x, Const v), acc)
+                         else Seq (acc, Assn (x, Const v))
+                      ) stmt state
+
+  let rec fixpoint eq f init =
+      let init' = f init in
+      if eq init init' 
+      then init'
+      else fixpoint eq f init'
+                     
+  let rec spec state = 
     function
-    | Skip        -> (Skip, state)
+    | Skip        -> Skip, state
     | Assn (x, e) ->
-       let e' = Expr.spec state e in
-       (match e' with
-        | Expr.Const ve -> (Skip        , State.set  state x ve)
-        | _             -> (Assn (x, e'), State.unset state x)
-       )
+      let e' = Expr.spec state e in
+      (match e' with
+       | Expr.Const ve -> Skip, State.set state x ve
+       | _             -> Assn (x, e'), State.unset state x
+      )
     | Seq (s1, s2) ->
-       (match spec state s1 with
-        | (Skip, state') -> spec state' s2
-        | (s1' , state') ->
-           (match spec state' s2 with
-            | (Skip, state'') -> (s1', state'')
-            | (s2' , state'') -> (Seq (s1', s2'), state'')
-           )
-       )
+      (match spec state s1 with
+       | Skip, state' -> spec state' s2
+       | s1' , state' ->
+          (match spec state' s2 with
+           | Skip, state'' -> s1', state''
+           | s2' , state'' -> Seq (s1', s2'), state''
+          )
+      )
     | If (c, t, e) ->
-       (match Expr.spec state c with
-        | Expr.Const cv when cv != 0 -> spec state t
-        | Expr.Const _               -> spec state e
-        | c'                         -> (residualize state (If (c', t, e)), State.empty) 
-       )
+      (match Expr.spec state c with
+       | Expr.Const cv when cv <> 0 -> spec state t
+       | Expr.Const _               -> spec state e
+       | c'                         ->
+         let t', t_state = spec state t in
+         let e', e_state = spec state e in
+         let state' = State.join t_state e_state in
+         let t'' = residualize (State.subtract t_state state') t' in
+         let e'' = residualize (State.subtract e_state state') e' in
+         (If (c', t'', e'')), state'
+      )
     | While (c, s) as w ->
-       (match Expr.spec state c with
-        | Expr.Const cv when cv != 0 -> spec state (Seq (s, w)) 
-        | Expr.Const cv              -> (Skip, state)
-        | c'                         -> (residualize state (While (c', s)), State.empty)
-       )
+      (match Expr.spec state c with
+       | Expr.Const cv when cv <> 0 -> spec state (Seq (s, w))
+       | Expr.Const cv              -> (Skip, state)
+       | __                         -> 
+         let state' = fixpoint State.equal
+            (fun state -> 
+              let _, state' = spec state s in
+              State.join state state'
+            ) state
+         in
+         let s', state_s = spec state' s in
+         let c' = Expr.spec state' c in
+         let res = While (c', residualize (State.subtract state_s state') s') in
+         let res = residualize ~before:true (State.subtract state state') res in
+         (res, state')
+      )
     | Do (s, c) -> spec state (Seq (s, While (c, s)))
-  
+
+  let indent_line depth stmt = Printf.sprintf "%s%s" (String.init (depth * 2) (fun _ -> ' ')) stmt
+
+  let rec to_string ?(depth=0) = function
+  | Assn (x, e) -> indent_line depth @@ Printf.sprintf "%s = %s;" x (Expr.to_string e)
+  | Seq (l, r) -> Printf.sprintf "%s\n%s" (to_string ~depth l) (to_string ~depth r)
+  | Skip -> indent_line depth "skip;"
+  | If (c, t, e) -> 
+     (indent_line depth @@ Printf.sprintf "if (%s) {\n" (Expr.to_string c))
+     ^ (to_string ~depth:(depth + 1) t)
+     ^ (if e = Skip then "\n" ^ (indent_line depth "}") else
+         "\n" ^ (indent_line depth "} else {\n")
+         ^ (to_string ~depth:(depth + 1) e)
+         ^ "\n" ^ (indent_line depth "}"))
+  | While (c, b) ->
+     (indent_line depth @@ Printf.sprintf "while (%s) {\n" (Expr.to_string c))
+     ^ (to_string ~depth:(depth + 1) b)
+     ^ "\n" ^ (indent_line depth "}")
+  | Do (b, c) ->
+     (indent_line depth "do {\n")
+     ^ (to_string ~depth:(depth + 1) b)
+     ^ "\n" ^ (indent_line depth @@ Printf.sprintf "} while (%s)" (Expr.to_string c))
 end
 
 module Parser =
@@ -375,7 +442,8 @@ let _ =
          | `Spec ->
             let (stmt', state') = Stmt.spec (Setup.getInput ()) stmt in
             let stmt'' = Stmt.residualize state' stmt' in
-            Printf.printf "%s\n" @@ Formeat.to_string (Stmt.pretty stmt'')
+            (* Printf.printf "%s\n" @@ Formeat.to_string (Stmt.pretty stmt'') *)
+            Printf.printf "{\n%s\n}\n" @@ Stmt.to_string ~depth:1 stmt''
         )
      | `Fail errs -> Printf.eprintf "ERROR: %s\n" errs
     )
