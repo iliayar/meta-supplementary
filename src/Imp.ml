@@ -72,9 +72,12 @@ module Expr =
 struct
   
   @type t =
-  | Var   of string
-  | Const of int    
-  | Binop of string * t * t
+  | Var    of string
+  | Const  of int    
+  | Binop  of string * t * t
+  | Elem   of t * t     (* Index of array *)
+  | Length of t         (* Length of arrat *)
+  | Subst  of t * t * t (* arr with i := v *)
   with show
 
   @type assoc = No | Left | Right with show
