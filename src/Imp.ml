@@ -89,26 +89,33 @@ module State =
       match M.find_opt x state with
       | Some v -> Printf.printf "%s=%s\n" x (show(Value.Printable.t) @@ Value.toPrintable v)
       | None   -> Printf.printf "%s undefined\n" x
-    
-    let diff st st' =
+
+    let residualize r z (state : t) =
       List.fold_left
-        (fun diffed (x, w) ->
-          match M.find_opt x st' with
-          | None -> M.add x w diffed
-          | _    -> diffed
-        )
-        M.empty
-        (M.bindings st)
-    
-    let join st st' =
-      List.fold_left
-        (fun joined (x, v) ->
-          match M.find_opt x st' with
-          | Some w -> M.add x (Value.join v w) joined
-          | _ -> joined
-        )
-        M.empty
-        (M.bindings st)
+        (fun acc (x, v) -> r acc x v)
+        z
+        @@ List.filter (function (_, Value.Dyn) -> false | _ -> true) (M.bindings state)
+
+    let join lstate rstate =
+      M.merge
+        (fun key l r -> match l, r with
+         | Some lv, Some rv -> Some (Value.join lv rv)
+         | None   , None    -> None
+         | _, _             -> Some Value.Dyn
+        ) lstate rstate
+
+    let diff lstate rstate =
+      M.merge
+        (fun key l r -> match l, r with
+         | None, _        -> None
+         | l, None        -> l
+         | Some (Value.Array l), Some (Value.Array r) when Array.length l = Array.length r ->
+              Some (Value.Array (Array.map2 
+                  (fun l r -> match l, r with
+                              | l', Value.Dyn -> l'
+                              | _, _ -> Value.Dyn) l r))
+         | Some _, Some _ -> Some Value.Dyn
+        ) lstate rstate
     
     exception Undefined_variable of string
     
@@ -116,18 +123,14 @@ module State =
       match M.find_opt name m with
       | Some x -> x
       | None   -> raise (Undefined_variable name)
+
+    let equal (l : t) (r : t) = M.equal (=) l r
     
     let dynamic m name =
       match M.find_opt name m with
       | None           -> true
       | Some Value.Dyn -> true
       | Some _         -> false
-    
-    let residualize r z state =
-      List.fold_left
-        (fun acc (x, v) -> r acc x v)
-        z
-        (M.bindings state)
     
     module Printable =
       struct
@@ -138,6 +141,7 @@ module State =
       let ostap (
         value:
           n:DECIMAL                      {Value.Int n}
+        | "?"                            {Value.Dyn}
         | "[" vs:!(Util.list)[value] "]" {Value.Array (Array.of_list vs)}
       )
       in      
@@ -219,6 +223,32 @@ module Expr =
          if prio op < prio context then rbr base
          else if prio op = prio context && assoc op <> position then rbr base
          else base       
+      | Array arr -> listBy (string "")
+        [ string "[";
+          listBy (string ", ") @@ Array.to_list @@ Array.map (pretty ("", No)) arr;
+          string "]" 
+        ]
+      | Subst (x, substs) -> 
+        listBy (string "") @@
+          [ string "[";
+            pretty ("", No) x;
+            string " with ";
+            listBy (string ", ") @@ List.map 
+             (fun (i, v) -> listBy (string "") 
+               [ pretty ("", No) i;
+                 string "=";
+                 pretty ("", No) v
+               ]) substs;
+            string "]"
+          ]
+      | Elem (x, i) ->
+        listBy (string "") @@
+          [ pretty ("", No) x;
+            string "[";
+            pretty ("", No) i;
+            string "]"
+          ]
+      | Length x -> listBy (string "") [pretty ("", No) x; string ".length"]
       in
       pretty ("", No) expr
     
@@ -252,16 +282,75 @@ module Expr =
     | Subst (a, ivs)  -> Value.subst (eval state a) (List.map (fun (i, v) -> eval state i, eval state v) ivs)
     | Array es        -> Value.Array (Array.map (eval state) es)
        
-    (*
-    let rec spec state = function
-    | Var   x as expr -> invalid_arg "not yet supported" (* if State.dynamic state x then expr else Const (State.get state x) (* Meeoow! *) *)
-    | Const x as expr -> expr
-    | Binop (op, x, y) ->
-       let x', y' = spec state x, spec state y in
-       match x', y' with
-       | Const xv, Const yv -> Const (evalBinop xv yv op)
-       | _, _ -> Binop (op, x', y')
-     *)
+    let rec spec (state : State.t) =
+      let open Value in
+      function
+      | Var x as expr    ->
+        if State.dynamic state x then expr
+        else
+          (match State.get state x with
+           | Value.Int n   -> Const n
+           | Value.Array l ->
+              Array (Array.mapi
+                      (fun i -> function
+                                | Value.Array _ -> failwith "Multidemsional arrays no supported"
+                                | Value.Int n   -> Const n
+                                | Value.Dyn     -> Elem (expr, Const i))
+                       l)
+           | _ -> failwith "unreachable"
+          )
+      | Const x as expr  -> expr
+      | Binop (op, x, y) ->
+        let x', y' = spec state x, spec state y in
+        (match x', y' with
+         | Const xv, Const yv -> Const !?(evalBinop (Value.Int xv) (Value.Int yv) op)
+         | _, _               -> Binop (op, x', y')
+        )
+      | Subst (Var a, substs) -> 
+        let substs' = List.map (fun (ie, ve) -> (spec state ie, spec state ve)) substs in
+        let substs_static = List.filter_map (fun (i, v) -> match i with Const iv -> Some (iv, v) | _ -> None ) substs' in
+        if List.length substs' <> List.length substs_static || State.dynamic state a then Subst (Var a, substs')
+        else (match State.get state a with
+              | Value.Int _     -> failwith "unreachable"
+              | Value.Dyn       -> Subst (Var a, substs')
+              | Value.Array arr -> 
+                Array (Array.mapi
+                        (fun i e -> match List.assoc_opt i substs_static with
+                                    | Some v -> v
+                                    | None   ->
+                                      match e with
+                                      | Value.Dyn     -> Elem (Var a, Const i)
+                                      | Value.Int v   -> Const v
+                                      | Value.Array _ -> failwith "unreachable")
+                        arr)
+             )
+      | Subst _ -> failwith "only Subst with specific var is supported"
+      | Elem (Var a, i) -> 
+        (match spec state i with
+         | Const i' ->
+           if State.dynamic state a then Elem (Var a, Const i')
+           else
+             (match State.get state a with
+              | Value.Dyn       -> Elem (Var a, Const i')
+              | Value.Int _     -> failwith "unreachable"
+              | Value.Array arr ->
+                match arr.(i') with
+                | Value.Dyn     -> Elem (Var a, Const i')
+                | Value.Array _ -> failwith "Multidemsional arrays no supported"
+                | Value.Int v   -> Const v
+             )
+         | i' -> Elem (Var a, i)
+        )
+      | Elem _ -> failwith "only Elem with specific var is supported"
+      | Length (Var a) ->
+        if State.dynamic state a then Length (Var a)
+        else
+          (match State.get state a with
+           | Value.Dyn       -> Length (Var a)
+           | Value.Int _     -> failwith "unreachable"
+           | Value.Array arr -> Const (Array.length arr)
+          )
+      | Length _ -> failwith "only Length with specific var is supported"
   end
 
 module Stmt =
@@ -322,67 +411,99 @@ module Stmt =
          then state
          else eval (eval state b) w                 
       | Do (b, c) as w -> eval state (Seq (b, While (c, b)))      
-    (*
-    let residualizeAfter state stmt =
+
+    let residualize ?(before=false) state stmt =
+      let single = fun x -> function
+        | Value.Int v     -> Assn (x, Const v)
+        | Value.Array arr ->
+          let assigns = List.filter_map (fun x -> x) @@ Array.to_list @@ Array.mapi
+            (fun i -> function
+             | Value.Int v   -> Some (Expr.Const i, Expr.Const v)
+             | Value.Array _ -> failwith "Multidemsional arrays not supported"
+             | Value.Dyn     -> None
+            ) arr
+          in if List.length assigns = 0 then Skip else Assn (x, Subst (Expr.Var x, assigns))
+        | Value.Dyn -> failwith "unreachable"
+      in
       State.residualize
         (function
-           Skip -> fun x v -> Assn (x, Expr.Const v)
-         | acc  -> fun x v -> Seq  (acc, Assn (x, Expr.Const v))
-        )
-        stmt
-        state
-    
-    let residualizeBefore state stmt =
-      match residualizeAfter state Skip with
-      | Skip -> stmt
-      | s    -> Seq (s, stmt)
-    
-    let rec spec state =
+         | Skip -> single
+         | acc  -> fun x v ->
+           (match single x v with
+            | Skip -> acc
+            | stmt -> if before then Seq (stmt, acc) else Seq (acc, stmt)
+           )
+           
+        ) stmt state
+
+    let rec fixpoint eq f init =
+        let init' = f init in
+        if eq init init' 
+        then init'
+        else fixpoint eq f init'
+                       
+    let rec spec (state : State.t) = 
       function
-      | Skip        -> (Skip, state)
+      | Skip        -> Skip, state
       | Assn (x, e) ->
-         let e' = Expr.spec state e in
-         (match e' with
-          | Expr.Const ve -> (Skip        , State.set   state x ve)
-          | _             -> (Assn (x, e'), State.unset state x)
-         )
+        let e' = Expr.spec state e in
+        (match e' with
+         | Expr.Const ve  -> Skip, State.set state x (Value.Int ve)
+         | Expr.Array arr -> 
+            let arr' = Array.map (function Expr.Const v -> Value.Int v | _ -> Value.Dyn) arr in
+            let substs = Array.mapi (fun i -> function 
+                                             | Expr.Const _ -> None 
+                                             | Expr.Elem (Var x', Expr.Const j) when x = x' && i = j -> None
+                                             | Expr.Elem (Var _, e) -> Some (Expr.Const i, e)
+                                             | Expr.Elem _ -> failwith "only Elem with specific var is supported"
+                                             | e -> Some (Expr.Const i, e)) arr in
+            let substs' = List.filter_map (fun x -> x) @@ Array.to_list substs in
+            let stmt = 
+              if List.length substs' = 0 then Skip
+              else Assn (x, Expr.Subst (Expr.Var x, substs'))
+            in
+            stmt, State.set state x (Value.Array arr')
+         | _             -> Assn (x, e'), State.unset state x
+        )
       | Seq (s1, s2) ->
-         (match spec state s1 with
-          | (Skip, state') -> spec state' s2
-          | (s1' , state') ->
-             (match spec state' s2 with
-              | (Skip, state'') -> (s1', state'')
-              | (s2' , state'') -> (Seq (s1', s2'), state'')
-             )
-         )
+        (match spec state s1 with
+         | Skip, state' -> spec state' s2
+         | s1' , state' ->
+            (match spec state' s2 with
+             | Skip, state'' -> s1', state''
+             | s2' , state'' -> Seq (s1', s2'), state''
+            )
+        )
       | If (c, t, e) ->
-         (match Expr.spec state c with
-          | Expr.Const cv when cv != 0 -> spec state t
-          | Expr.Const _               -> spec state e
-          | c' ->
-             let t', state'  = spec state t in
-             let e', state'' = spec state e in
-             let joined      = State.join state' state'' in
-             If (c', residualizeAfter (State.diff state'  joined) t',
-                 residualizeAfter (State.diff state'' joined) e'),
-             joined
-         )
+        (match Expr.spec state c with
+         | Expr.Const cv when cv <> 0 -> spec state t
+         | Expr.Const _               -> spec state e
+         | c'                         ->
+           let t', t_state = spec state t in
+           let e', e_state = spec state e in
+           let state' = State.join t_state e_state in
+           let t'' = residualize (State.diff t_state state') t' in
+           let e'' = residualize (State.diff e_state state') e' in
+           (If (c', t'', e'')), state'
+        )
       | While (c, s) as w ->
-         (match Expr.spec state c with
-          | Expr.Const cv when cv != 0 -> spec state (Seq (s, w)) 
-          | Expr.Const cv              -> (Skip, state)
-          | _ ->
-             let _ , state'   = spec state s                     in
-             let _ , state''  = spec (State.join state state') s in
-             let state''      = State.join state state''         in
-             let s', state''' = spec state'' s                   in
-             residualizeBefore
-               (State.diff state state'')
-               (While (Expr.spec state'' c, residualizeAfter (State.diff state''' state'') s')),
-             state''
-         )
+        (match Expr.spec state c with
+         | Expr.Const cv when cv <> 0 -> spec state (Seq (s, w))
+         | Expr.Const cv              -> (Skip, state)
+         | _                          -> 
+           let state' = fixpoint State.equal
+              (fun state -> 
+                let _, state' = spec state s in
+                State.join state state'
+              ) state
+           in
+           let s', state_s = spec state' s in
+           let c' = Expr.spec state' c in
+           let res = While (c', residualize (State.diff state_s state') s') in
+           let res = residualize ~before:true (State.diff state state') res in
+           (res, state')
+        )
       | Do (s, c) -> spec state (Seq (s, While (c, s)))
-     *)    
   end
 
 module Parser =
@@ -523,12 +644,10 @@ let _ =
      | `Ok stmt ->
         (match Setup.getMode () with
          | `Run  -> Printf.printf "%s\n" @@ show (State.Printable.t) (State.toPrintable @@ Stmt.eval (Setup.getInput ()) stmt)
-         | `Spec -> invalid_arg "not yet implemented"
-         (*
+         | `Spec ->
             let (stmt', state') = Stmt.spec (Setup.getInput ()) stmt in
-            let stmt'' = Stmt.residualizeAfter state' stmt' in
+            let stmt'' = Stmt.residualize state' stmt' in
             Printf.printf "%s\n" @@ Formeat.to_string (Stmt.pretty stmt'')
-          *)
         )
      | `Fail errs -> Printf.eprintf "ERROR: %s\n" errs
     )

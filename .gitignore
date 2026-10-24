@@ -1,0 +1,14 @@
+# Nix
+.direnv
+
+# Build
+src/*.cmi
+src/*.cmx
+src/*.o
+src/*.cmo
+src/*.byte
+src/Imp
+src/.depend
+_build
+
+src/exp_spec.imp
