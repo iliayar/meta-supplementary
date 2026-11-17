@@ -1,0 +1,5 @@
+{
+    x = Cons (3, x);
+    x = Cons (2, x);
+    x = Cons (1, x);
+}
